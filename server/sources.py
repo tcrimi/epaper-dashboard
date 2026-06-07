@@ -120,7 +120,11 @@ def _fetch_apod() -> dict[str, Any] | None:
 
 
 def get_apod() -> dict[str, Any] | None:
-    return _cached("apod", ttl_seconds=6 * 3600, fn=_fetch_apod)
+    # Date-keyed: a new UTC day forces a synchronous fetch rather than the
+    # stale-while-revalidate path, which otherwise serves yesterday's image
+    # for the entire morning.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _cached(f"apod:{today}", ttl_seconds=6 * 3600, fn=_fetch_apod)
 
 
 def download_image(url: str) -> Image.Image | None:
@@ -137,6 +141,27 @@ def download_image(url: str) -> Image.Image | None:
 # ---------------------------- NWS weather ----------------------------
 
 
+def _nws_icon_key(icon_url: str | None) -> str | None:
+    """Extract the icon name from an NWS icon URL.
+
+    NWS URLs look like:
+        https://api.weather.gov/icons/land/day/tsra_sct,40?size=medium
+        https://api.weather.gov/icons/land/day/rain,50/snow?size=medium  (mixed)
+    We take the primary (first) icon and strip the optional ",probability" tail."""
+    if not icon_url:
+        return None
+    path = icon_url.split("?", 1)[0]
+    parts = path.rstrip("/").split("/")
+    idx = -1
+    for tod in ("day", "night"):
+        if tod in parts:
+            idx = parts.index(tod)
+            break
+    if idx == -1 or idx + 1 >= len(parts):
+        return None
+    return parts[idx + 1].split(",", 1)[0]
+
+
 def _nws_grid() -> dict[str, str]:
     """One-shot lookup of grid endpoint for our lat/lon."""
     r = requests.get(
@@ -146,35 +171,51 @@ def _nws_grid() -> dict[str, str]:
     )
     r.raise_for_status()
     props = r.json()["properties"]
-    return {
-        "forecast_hourly": props["forecastHourly"],
-        "stations_url": props["observationStations"],
-    }
+    return {"forecast": props["forecast"]}
 
 
-def _fetch_weather() -> dict[str, Any] | None:
+def _fetch_forecast() -> list[dict[str, Any]]:
+    """Up to 7 days of daily forecast. Pairs each daytime period with the
+    following nighttime period for the low temperature."""
     grid = _cached("nws_grid", ttl_seconds=30 * 24 * 3600, fn=_nws_grid)
     if not grid:
-        return None
+        return []
     r = requests.get(
-        grid["forecast_hourly"],
+        grid["forecast"],
         timeout=_HTTP_TIMEOUT,
         headers={"User-Agent": USER_AGENT, "Accept": "application/geo+json"},
     )
     r.raise_for_status()
     periods = r.json()["properties"]["periods"]
-    if not periods:
-        return None
-    now = periods[0]
-    return {
-        "temp_f": int(now["temperature"]),
-        "short": now["shortForecast"],
-        "is_daytime": now["isDaytime"],
-    }
+
+    today = datetime.now().date()
+    days: list[dict[str, Any]] = []
+    for i, p in enumerate(periods):
+        if not p.get("isDaytime"):
+            continue
+        low: int | None = None
+        for q in periods[i + 1:]:
+            if not q.get("isDaytime"):
+                low = q.get("temperature")
+                break
+        try:
+            dt = datetime.fromisoformat(p["startTime"])
+        except (KeyError, ValueError):
+            continue
+        days.append({
+            "label": "TODAY" if dt.date() == today else dt.strftime("%a").upper(),
+            "high": p.get("temperature"),
+            "low": low,
+            "short": p.get("shortForecast", ""),
+            "icon_key": _nws_icon_key(p.get("icon")),
+            "is_weekend": dt.weekday() >= 5,
+        })
+    return days
 
 
-def get_weather() -> dict[str, Any] | None:
-    return _cached("weather", ttl_seconds=30 * 60, fn=_fetch_weather)
+def get_forecast() -> list[dict[str, Any]]:
+    cached = _cached("forecast", ttl_seconds=30 * 60, fn=_fetch_forecast)
+    return cached or []
 
 
 # ---------------------------- Wikipedia: On this day ----------------------------
@@ -200,7 +241,10 @@ def _fetch_on_this_day() -> list[dict[str, Any]]:
 
 
 def get_on_this_day() -> list[dict[str, Any]]:
-    cached = _cached("otd", ttl_seconds=6 * 3600, fn=_fetch_on_this_day)
+    # Date-keyed for the same reason as get_apod — otherwise the 5am refresh
+    # sees the previous day's events served stale from cache.
+    today = datetime.now().strftime("%m-%d")
+    cached = _cached(f"otd:{today}", ttl_seconds=6 * 3600, fn=_fetch_on_this_day)
     return cached or []
 
 
@@ -214,8 +258,8 @@ def warmup() -> None:
     relevant section will render as '—' until the next background refresh."""
     print("[sources] warmup: apod...", flush=True)
     get_apod()
-    print("[sources] warmup: weather...", flush=True)
-    get_weather()
+    print("[sources] warmup: forecast...", flush=True)
+    get_forecast()
     print("[sources] warmup: on-this-day...", flush=True)
     get_on_this_day()
     print("[sources] warmup complete", flush=True)

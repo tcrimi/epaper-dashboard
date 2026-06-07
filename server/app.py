@@ -1,5 +1,6 @@
 """Flask app: browser preview + raw frame buffer for the R4."""
 import os
+import sys
 from datetime import datetime, timedelta
 from time import time
 
@@ -79,10 +80,15 @@ def frame():
 
 
 if __name__ == "__main__":
+    # Debug mode runs Werkzeug's auto-reloader, which tries to manipulate the
+    # controlling terminal — that fails (termios.error) when we have no TTY
+    # (e.g., running under nohup). Default to interactive=on, but force it off
+    # when stdin isn't a tty, or when FLASK_DEBUG=0 is set explicitly.
+    debug = sys.stdin.isatty() and os.environ.get("FLASK_DEBUG", "1") != "0"
+
     # In Flask debug mode the script is run twice: once as the reloader parent
     # and once as the worker (only the worker has WERKZEUG_RUN_MAIN set).
     # Warm the cache only in the worker so we don't pay for it twice.
-    debug = True
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         sources.warmup()
     app.run(host="0.0.0.0", port=5002, debug=debug)

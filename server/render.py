@@ -1,5 +1,6 @@
 """Render the dashboard image and quantize it to the Waveshare 7.3" Spectra 6 palette."""
 from datetime import datetime
+from pathlib import Path
 import io
 import textwrap
 
@@ -12,9 +13,9 @@ HEIGHT = 480
 
 # Layout regions (x0, y0, x1, y1).
 HEADER = (0, 0, WIDTH, 50)
-IMAGE_BOX = (0, 50, 500, 440)
-SIDEBAR = (500, 50, WIDTH, 440)
-FOOTER = (0, 440, WIDTH, HEIGHT)
+IMAGE_BOX = (0, 50, 500, 380)
+SIDEBAR = (500, 50, WIDTH, 380)
+FORECAST = (0, 380, WIDTH, HEIGHT)
 
 # Spectra 6 4-bit codes the panel expects on the wire.
 BLACK_CODE = 0x0
@@ -74,6 +75,59 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+_WI_FONT_PATH = Path(__file__).parent / "fonts" / "weathericons-regular-webfont.ttf"
+_wi_font_cache: dict[int, ImageFont.ImageFont] = {}
+
+
+def _wi_font(size: int) -> ImageFont.ImageFont:
+    f = _wi_font_cache.get(size)
+    if f is None:
+        f = ImageFont.truetype(str(_WI_FONT_PATH), size)
+        _wi_font_cache[size] = f
+    return f
+
+
+# NWS icon key (the "tsra_sct" part of the icon URL) -> (weather-icons glyph, color).
+# Codepoints from erikflowers/weather-icons CSS.
+WEATHER_ICONS: dict[str, tuple[str, tuple[int, int, int]]] = {
+    "skc":             ("", YELLOW),  # wi-day-sunny
+    "few":             ("", YELLOW),
+    "sct":             ("", YELLOW),  # wi-day-cloudy
+    "bkn":             ("", BLACK),   # wi-day-cloudy-high
+    "ovc":             ("", BLACK),   # wi-cloudy
+    "wind_skc":        ("", YELLOW),  # wi-day-windy
+    "wind_few":        ("", YELLOW),
+    "wind_sct":        ("", YELLOW),
+    "wind_bkn":        ("", BLACK),   # wi-strong-wind
+    "wind_ovc":        ("", BLACK),
+    "rain":            ("", BLUE),    # wi-rain
+    "rain_showers":    ("", BLUE),    # wi-showers
+    "rain_showers_hi": ("", BLUE),
+    "tsra":            ("", RED),     # wi-thunderstorm
+    "tsra_sct":        ("", RED),
+    "tsra_hi":         ("", RED),
+    "snow":            ("", BLUE),    # wi-snow
+    "sleet":           ("", BLUE),    # wi-sleet
+    "snow_sleet":      ("", BLUE),
+    "snow_fzra":       ("", BLUE),    # wi-rain-mix
+    "rain_snow":       ("", BLUE),
+    "rain_sleet":      ("", BLUE),
+    "rain_fzra":       ("", BLUE),
+    "fzra":            ("", BLUE),
+    "fog":             ("", BLACK),   # wi-fog
+    "dust":            ("", BLACK),   # wi-dust
+    "smoke":           ("", BLACK),   # wi-smoke
+    "haze":            ("", BLACK),   # wi-day-haze
+    "hot":             ("", RED),     # wi-hot
+    "cold":            ("", BLUE),    # wi-snowflake-cold
+    "blizzard":        ("", BLUE),    # wi-snow-wind
+    "tornado":         ("", RED),     # wi-tornado
+    "hurricane":       ("", RED),     # wi-hurricane
+    "tropical_storm":  ("", BLUE),    # wi-storm-showers
+}  # type: ignore[no-redef]
+_WI_FALLBACK = ("", BLACK)  # wi-na (not available)
+
+
 def _temp_color(temp_f: int | None):
     if temp_f is None:
         return BLACK
@@ -82,6 +136,14 @@ def _temp_color(temp_f: int | None):
     if temp_f >= 80:
         return RED
     return BLACK
+
+
+def _truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> str:
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    while text and draw.textlength(text + "…", font=font) > max_w:
+        text = text[:-1]
+    return text + "…" if text else ""
 
 
 def _fit_image_into(box: tuple[int, int, int, int], img: Image.Image) -> tuple[Image.Image, tuple[int, int]]:
@@ -98,40 +160,20 @@ def _fit_image_into(box: tuple[int, int, int, int], img: Image.Image) -> tuple[I
     return resized, (paste_x, paste_y)
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, weather: dict | None) -> None:
+def _draw_header(draw: ImageDraw.ImageDraw, apod: dict | None) -> None:
     now = datetime.now()
     date_str = now.strftime("%a · %b %-d")
     font_date = _font(32)
+    date_w = draw.textlength(date_str, font=font_date)
     draw.text((20, 6), date_str, fill=BLACK, font=font_date)
 
-    # Right side: location + temp + condition
-    font_temp = _font(32)
-    font_cond = _font(22)
-    if weather:
-        temp = weather["temp_f"]
-        cond = weather["short"]
-        temp_color = _temp_color(temp)
-        loc_text = f"{sources.LOCATION_LABEL}"
-        temp_text = f"{temp}°F"
-
-        # Build from the right edge.
-        cond_w = draw.textlength(cond, font=font_cond)
-        temp_w = draw.textlength(temp_text, font=font_temp)
-        loc_w = draw.textlength(loc_text, font=font_temp)
-        gap = 16
-
-        right = WIDTH - 20
-        cond_x = right - cond_w
-        draw.text((cond_x, 14), cond, fill=BLACK, font=font_cond)
-
-        temp_x = cond_x - gap - temp_w
-        draw.text((temp_x, 6), temp_text, fill=temp_color, font=font_temp)
-
-        loc_x = temp_x - gap - loc_w
-        draw.text((loc_x, 6), loc_text, fill=BLACK, font=font_temp)
-    else:
-        font_dash = _font(28)
-        draw.text((WIDTH - 80, 8), "—", fill=BLACK, font=font_dash)
+    # APOD title on the right.
+    if apod and apod.get("title"):
+        font_title = _font(20)
+        max_w = WIDTH - 40 - int(date_w) - 30  # 20px padding each side + gap
+        title = _truncate_to_width(draw, apod["title"], font_title, max_w)
+        title_w = draw.textlength(title, font=font_title)
+        draw.text((WIDTH - 20 - title_w, 16), title, fill=BLACK, font=font_title)
 
     # Hairline under header.
     draw.line([(0, HEADER[3] - 1), (WIDTH, HEADER[3] - 1)], fill=BLACK, width=1)
@@ -177,12 +219,57 @@ def _draw_sidebar(draw: ImageDraw.ImageDraw, events: list[dict]) -> None:
     draw.line([(sx0, sy0), (sx0, sy1)], fill=BLACK, width=1)
 
 
-def _draw_footer(draw: ImageDraw.ImageDraw, apod_title: str | None) -> None:
-    fx0, fy0, fx1, fy1 = FOOTER
-    draw.rectangle([fx0, fy0, fx1, fy1], fill=BLACK)
-    title = apod_title or "No image today"
-    font = _font(20)
-    draw.text((fx0 + 16, fy0 + 8), f"NASA: {title}", fill=WHITE, font=font)
+def _draw_condition_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int,
+                         icon_key: str | None, size: int = 36) -> None:
+    """Render a Weather Icons glyph at (cx, cy). Color from the WEATHER_ICONS map."""
+    glyph, color = WEATHER_ICONS.get(icon_key or "", _WI_FALLBACK)
+    font = _wi_font(size)
+    bbox = draw.textbbox((0, 0), glyph, font=font)
+    gw = bbox[2] - bbox[0]
+    gh = bbox[3] - bbox[1]
+    draw.text((cx - gw // 2 - bbox[0], cy - gh // 2 - bbox[1]),
+              glyph, fill=color, font=font)
+
+
+def _draw_forecast(draw: ImageDraw.ImageDraw, forecast: list[dict]) -> None:
+    fx0, fy0, fx1, fy1 = FORECAST
+    draw.line([(0, fy0), (WIDTH, fy0)], fill=BLACK, width=1)
+
+    if not forecast:
+        draw.text((20, fy0 + 38), "Forecast unavailable", fill=BLACK, font=_font(22))
+        return
+
+    n = min(len(forecast), 7)
+    day_font = _font(20)
+    temp_font = _font(26)
+
+    for i in range(n):
+        day = forecast[i]
+        box_x0 = (WIDTH * i) // n
+        box_x1 = (WIDTH * (i + 1)) // n
+        cx = (box_x0 + box_x1) // 2
+
+        if i > 0:
+            draw.line([(box_x0, fy0 + 10), (box_x0, fy1 - 10)], fill=BLACK, width=1)
+
+        label = day["label"]
+        day_color = BLUE if day.get("is_weekend") else BLACK
+        lw = draw.textlength(label, font=day_font)
+        draw.text((cx - lw / 2, fy0 + 6), label, fill=day_color, font=day_font)
+
+        _draw_condition_icon(draw, cx, fy0 + 48, day.get("icon_key"))
+
+        high = day.get("high")
+        low = day.get("low")
+        if high is not None and low is not None:
+            temp_str = f"{high}°/{low}°"
+        elif high is not None:
+            temp_str = f"{high}°"
+        else:
+            temp_str = "—"
+        temp_color = _temp_color(high)
+        tw = draw.textlength(temp_str, font=temp_font)
+        draw.text((cx - tw / 2, fy0 + 70), temp_str, fill=temp_color, font=temp_font)
 
 
 def render_rgb() -> Image.Image:
@@ -191,10 +278,10 @@ def render_rgb() -> Image.Image:
     draw = ImageDraw.Draw(img)
 
     apod = sources.get_apod()
-    weather = sources.get_weather()
+    forecast = sources.get_forecast()
     events = sources.get_on_this_day()
 
-    _draw_header(draw, weather)
+    _draw_header(draw, apod)
 
     # Hero image area.
     apod_image = None
@@ -213,7 +300,7 @@ def render_rgb() -> Image.Image:
         )
 
     _draw_sidebar(draw, events)
-    _draw_footer(draw, apod.get("title") if apod else None)
+    _draw_forecast(draw, forecast)
 
     return img
 

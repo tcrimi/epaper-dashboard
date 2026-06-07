@@ -5,4 +5,5 @@ __pycache__/
 venv/
 .env
 nohup.out
+server.log
 firmware/epaper_dashboard/secrets.h
