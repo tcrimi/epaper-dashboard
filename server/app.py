@@ -14,6 +14,10 @@ app = Flask(__name__)
 # Hour of the day (server local time) when the dashboard should refresh.
 DAILY_REFRESH_HOUR = int(os.environ.get("DAILY_REFRESH_HOUR", "5"))
 
+# Port the server listens on. Defaults to 5000, but macOS hands that port to the
+# AirPlay Receiver, so set PORT (e.g. 5002) in server/.env on a Mac.
+PORT = int(os.environ.get("PORT", "5000"))
+
 
 def ms_until_next_refresh() -> int:
     """Milliseconds from now until the next DAILY_REFRESH_HOUR boundary."""
@@ -91,4 +95,4 @@ if __name__ == "__main__":
     # Warm the cache only in the worker so we don't pay for it twice.
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         sources.warmup()
-    app.run(host="0.0.0.0", port=5002, debug=debug)
+    app.run(host="0.0.0.0", port=PORT, debug=debug)

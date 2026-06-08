@@ -88,9 +88,12 @@ cp .env.example .env          # then add your NASA API key (optional)
 python3 app.py
 ```
 
-Open <http://localhost:5002> to see a live browser preview of the quantized
+Open <http://localhost:5000> to see a live browser preview of the quantized
 frame. The raw buffer the board fetches is at
-[`/frame.bin`](http://localhost:5002/frame.bin).
+[`/frame.bin`](http://localhost:5000/frame.bin).
+
+> **macOS:** port 5000 is taken by the AirPlay Receiver, so set `PORT=5002` (or
+> any free port) in `server/.env` and use that port everywhere below.
 
 A free **NASA API key** (from <https://api.nasa.gov>) is optional but
 recommended — `DEMO_KEY` is limited to ~30 requests/hour. Drop it into
@@ -106,7 +109,7 @@ NASA_API_KEY=your_key_here
 |---------------------|------------------------------------|----------------|
 | Location (lat/lon)  | `server/sources.py` (`LAT`/`LON`)  | NYC / Central Park |
 | Daily refresh hour  | `DAILY_REFRESH_HOUR` env var       | `5` (5am, server local time) |
-| Server port         | `app.py`                           | `5002`         |
+| Server port         | `PORT` env var / `.env`            | `5000` (use `5002` on macOS) |
 | NASA API key        | `NASA_API_KEY` env var / `.env`    | `DEMO_KEY`     |
 
 ### Running detached
@@ -133,10 +136,11 @@ cd server
    #define WIFI_SSID     "your-ssid"
    #define WIFI_PASSWORD "your-password"
    #define SERVER_HOST   "192.168.1.100"   // your server's LAN IP
-   #define SERVER_PORT   5002              // must match the Flask port
+   #define SERVER_PORT   5000              // match the server's PORT (5002 on macOS)
    ```
 
-   > **Note:** the server listens on **5002**; set `SERVER_PORT` to match.
+   > **Note:** `SERVER_PORT` must match the port the server actually listens on
+   (the `PORT` env var, default 5000 — but 5002 if you set it for macOS).
    `secrets.h` is gitignored so your credentials stay out of the repo.
 
 4. Flash the board. The built-in 12×8 LED matrix shows a **beating heart**
