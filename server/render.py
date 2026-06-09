@@ -160,18 +160,21 @@ def _fit_image_into(box: tuple[int, int, int, int], img: Image.Image) -> tuple[I
     return resized, (paste_x, paste_y)
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, apod: dict | None) -> None:
+def _draw_header(draw: ImageDraw.ImageDraw, hero: dict | None) -> None:
     now = datetime.now()
     date_str = now.strftime("%a · %b %-d")
     font_date = _font(32)
     date_w = draw.textlength(date_str, font=font_date)
     draw.text((20, 6), date_str, fill=BLACK, font=font_date)
 
-    # APOD title on the right.
-    if apod and apod.get("title"):
+    # Hero title on the right — APOD title, or "Title · Artist" for museum art.
+    if hero and hero.get("title"):
         font_title = _font(20)
         max_w = WIDTH - 40 - int(date_w) - 30  # 20px padding each side + gap
-        title = _truncate_to_width(draw, apod["title"], font_title, max_w)
+        label = hero["title"]
+        if hero.get("artist"):
+            label = f"{label} · {hero['artist']}"
+        title = _truncate_to_width(draw, label, font_title, max_w)
         title_w = draw.textlength(title, font=font_title)
         draw.text((WIDTH - 20 - title_w, 16), title, fill=BLACK, font=font_title)
 
@@ -179,7 +182,32 @@ def _draw_header(draw: ImageDraw.ImageDraw, apod: dict | None) -> None:
     draw.line([(0, HEADER[3] - 1), (WIDTH, HEADER[3] - 1)], fill=BLACK, width=1)
 
 
-def _draw_sidebar(draw: ImageDraw.ImageDraw, events: list[dict]) -> None:
+def _draw_sun_moon(draw: ImageDraw.ImageDraw, sm: dict,
+                   sx0: int, sx1: int, sy1: int, pad: int) -> None:
+    """Almanac footer at the bottom of the sidebar: sunrise/sunset and moon phase.
+    Moon glyph reuses the bundled Weather Icons font (28 phase glyphs f095..f0b0)."""
+    wi = _wi_font(20)
+    small = _font(15)
+    fy = sy1 - 50
+    draw.line([(sx0 + pad, fy - 8), (sx1 - pad, fy - 8)], fill=BLACK, width=1)
+
+    # Sun line: sunrise (☀↑) then sunset (☀↓). chr() codepoints, like the moon
+    # glyph, since literal PUA characters don't survive reliably in source.
+    draw.text((sx0 + pad, fy), chr(0xF051), fill=YELLOW, font=wi)        # wi-sunrise
+    draw.text((sx0 + pad + 26, fy + 3),
+              f"{sm['sunrise'].strftime('%-I:%M')}a", fill=BLACK, font=small)
+    draw.text((sx0 + pad + 100, fy), chr(0xF052), fill=YELLOW, font=wi)  # wi-sunset
+    draw.text((sx0 + pad + 126, fy + 3),
+              f"{sm['sunset'].strftime('%-I:%M')}p", fill=BLACK, font=small)
+
+    # Moon line: phase glyph + name + illumination.
+    my = fy + 26
+    draw.text((sx0 + pad, my), chr(0xF095 + sm["moon_glyph_index"]), fill=BLACK, font=wi)
+    draw.text((sx0 + pad + 26, my + 3),
+              f"{sm['moon_name']} {sm['moon_illum']}%", fill=BLACK, font=small)
+
+
+def _draw_sidebar(draw: ImageDraw.ImageDraw, events: list[dict], sun_moon: dict | None) -> None:
     sx0, sy0, sx1, sy1 = SIDEBAR
     pad = 16
 
@@ -193,27 +221,32 @@ def _draw_sidebar(draw: ImageDraw.ImageDraw, events: list[dict]) -> None:
     # Width available for wrapping.
     text_width_px = (sx1 - sx0) - 2 * pad
 
+    # Reserve room at the bottom for the sun/moon footer when we have it.
+    events_bottom = sy1 - (58 if sun_moon else 0)
+
     if not events:
         draw.text((sx0 + pad, cursor_y), "—", fill=BLACK, font=event_font)
-        return
-
-    for ev in events:
-        if cursor_y > sy1 - 30:
-            break
-        year_str = str(ev["year"])
-        draw.text((sx0 + pad, cursor_y), year_str, fill=BLUE, font=year_font)
-        cursor_y += 26
-
-        # Wrap event text. textbbox-based wrapping is fiddly; approximate by
-        # character count tuned to the font and box width.
-        chars_per_line = max(10, text_width_px // 8)
-        wrapped = textwrap.wrap(ev["text"], width=chars_per_line)
-        for line in wrapped[:3]:
-            if cursor_y > sy1 - 20:
+    else:
+        for ev in events:
+            if cursor_y > events_bottom - 28:
                 break
-            draw.text((sx0 + pad + 8, cursor_y), line, fill=BLACK, font=event_font)
-            cursor_y += 18
-        cursor_y += 10
+            year_str = str(ev["year"])
+            draw.text((sx0 + pad, cursor_y), year_str, fill=BLUE, font=year_font)
+            cursor_y += 26
+
+            # Wrap event text. textbbox-based wrapping is fiddly; approximate by
+            # character count tuned to the font and box width.
+            chars_per_line = max(10, text_width_px // 8)
+            wrapped = textwrap.wrap(ev["text"], width=chars_per_line)
+            for line in wrapped[:3]:
+                if cursor_y > events_bottom - 18:
+                    break
+                draw.text((sx0 + pad + 8, cursor_y), line, fill=BLACK, font=event_font)
+                cursor_y += 18
+            cursor_y += 10
+
+    if sun_moon:
+        _draw_sun_moon(draw, sun_moon, sx0, sx1, sy1, pad)
 
     # Vertical separator on the left edge of the sidebar.
     draw.line([(sx0, sy0), (sx0, sy1)], fill=BLACK, width=1)
@@ -277,29 +310,30 @@ def render_rgb() -> Image.Image:
     img = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
     draw = ImageDraw.Draw(img)
 
-    apod = sources.get_apod()
+    hero = sources.get_hero()
     forecast = sources.get_forecast()
     events = sources.get_on_this_day()
+    sun_moon = sources.get_sun_moon()
 
-    _draw_header(draw, apod)
+    _draw_header(draw, hero)
 
     # Hero image area.
-    apod_image = None
-    if apod and apod.get("url"):
-        apod_image = sources.download_image(apod["url"])
-    if apod_image:
-        resized, pos = _fit_image_into(IMAGE_BOX, apod_image)
+    hero_image = None
+    if hero and hero.get("url"):
+        hero_image = sources.download_image(hero["url"])
+    if hero_image:
+        resized, pos = _fit_image_into(IMAGE_BOX, hero_image)
         img.paste(resized, pos)
     else:
         # No image: gray-ish placeholder text.
         draw.text(
             (IMAGE_BOX[0] + 40, IMAGE_BOX[1] + 160),
-            "NASA APOD unavailable",
+            "Hero image unavailable",
             fill=BLACK,
             font=_font(28),
         )
 
-    _draw_sidebar(draw, events)
+    _draw_sidebar(draw, events, sun_moon)
     _draw_forecast(draw, forecast)
 
     return img

@@ -8,26 +8,34 @@ full color, quantizes it down to the panel's 6-color palette with
 Floyd–Steinberg dithering, and serves it as a raw 4bpp buffer
 (`/frame.bin`, 192000 bytes). The R4 has no display library and no image
 decoding to do — it just fetches that buffer and streams the bytes straight to
-the panel over SPI. Once a day (5am by default) it wakes, pulls a fresh frame,
-draws it, and puts the panel back to sleep.
+the panel over SPI. A few times a day (5am, noon, and 6pm by default) it wakes,
+pulls a fresh frame, draws it, and puts the panel back to sleep.
 
 The dashboard shows:
 
-- 🛰️ **NASA Astronomy Picture of the Day** as the hero image (falls back to
-  yesterday's if today's APOD is a video)
-- 📅 **"On this day"** historical events from Wikipedia
+- 🖼️ A **hero image** that rotates through the day: NASA's Astronomy Picture of
+  the Day on the morning wake, then public-domain artwork from the **Art
+  Institute of Chicago** and the **Met** at midday and evening (the
+  **Rijksmuseum** joins the rotation if you add a key). APOD is the fallback
+  whenever art can't be fetched (and falls back to yesterday's APOD if today's
+  is a video)
+- 📅 **"On this day"** historical events from Wikipedia, with a **sun & moon
+  almanac** (sunrise/sunset and moon phase) below them — computed offline
 - 🌦️ A **7-day weather forecast** from the US National Weather Service, with
   Weather Icons glyphs and high/low temperatures
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│ Sat · Jun 7                         APOD title here    │  header
+│ Sat · Jun 7                    Hero title · Artist     │  header
 ├───────────────────────────────┬──────────────────────┤
 │                               │  ON THIS DAY          │
 │                               │  1893                 │
-│        NASA APOD image        │  Some event…          │  hero + sidebar
+│       APOD / artwork image    │  Some event…          │  hero + sidebar
 │         (letterboxed)         │  1969                 │
 │                               │  Another event…       │
+│                               ├──────────────────────┤
+│                               │  ☀ 6:32a   ☀ 7:48p    │  sun & moon almanac
+│                               │  ☾ Waxing Gibbous 88% │
 ├───────┬───────┬───────┬───────┴──────┬───────┬───────┤
 │ TODAY │  SUN  │  MON  │  TUE  │  WED  │  THU  │  FRI  │
 │   ☀   │   ⛅  │   🌧  │   ☀   │   ☀   │   ⛅  │   🌧  │  forecast strip
@@ -46,14 +54,21 @@ The dashboard shows:
   └─────────────────┘   X-Next-Refresh-Ms │  pipe bytes to SPI │          └──────────┘
         │                                 └────────────────────┘
         ▼ fetches
-  NASA APOD · NWS forecast · Wikipedia "On this day"
+  NASA APOD · Art Institute / Met / Rijksmuseum · NWS forecast · Wikipedia "On this day"
 ```
 
 The server response carries an **`X-Next-Refresh-Ms`** header telling the board
 how long to sleep before its next fetch — computed as the time until the next
-daily refresh hour. The board honors it (with a 60s safety floor) so the refresh
-schedule lives entirely on the server; reflashing the firmware isn't needed to
-change it.
+scheduled refresh hour. The board honors it (with a 60s safety floor) so the
+refresh schedule lives entirely on the server; reflashing the firmware isn't
+needed to change it.
+
+Of the data sources, only the forecast and the rotating artwork change between
+the daily APOD wakes — so a handful of set refresh times (default 5am / noon /
+6pm) keeps the board current without flashing the panel all day. Ahead of each
+wake, a background prewarmer picks and downloads the next hero (with retries,
+falling back to APOD) so the board reads a ready image instead of waiting on a
+fetch.
 
 The server keeps an in-memory **stale-while-revalidate** cache for every upstream
 source, so renders are fast and the external APIs never get hammered: an expired
@@ -66,7 +81,7 @@ cache miss blocks.
 server/                       Flask render server (runs on your machine / a Pi)
   app.py                      Routes: / (preview), /preview.png, /frame.bin
   render.py                   Layout + Spectra 6 quantization and 4bpp packing
-  sources.py                  NASA APOD, NWS weather, Wikipedia "On this day"
+  sources.py                  NASA APOD, museum art, sun/moon, NWS weather, Wikipedia "On this day"
   fonts/                      Weather Icons font for forecast glyphs
   start.sh / stop.sh          Run the server detached via nohup
   .env.example                Copy to .env, add your NASA API key
@@ -108,9 +123,22 @@ NASA_API_KEY=your_key_here
 | Setting             | Where                              | Default        |
 |---------------------|------------------------------------|----------------|
 | Location (lat/lon)  | `server/sources.py` (`LAT`/`LON`)  | NYC / Central Park |
-| Daily refresh hour  | `DAILY_REFRESH_HOUR` env var       | `5` (5am, server local time) |
+| Refresh hours       | `REFRESH_HOURS` env var            | `5,12,18` (server local time) |
+| Art-rotation hour   | `ART_FROM_HOUR` env var            | `11` (wakes at/after 11am show artwork, earlier ones APOD) |
+| Prewarm lead        | `PREWARM_LEAD_MIN` env var         | `15` (minutes before a wake to fetch the next hero) |
 | Server port         | `PORT` env var / `.env`            | `5000` (use `5002` on macOS) |
 | NASA API key        | `NASA_API_KEY` env var / `.env`    | `DEMO_KEY`     |
+| Rijksmuseum key     | `RIJKSMUSEUM_KEY` env var / `.env` | unset (Art Institute + Met only) |
+
+`REFRESH_HOURS` is a comma-separated list of hours, e.g. `REFRESH_HOURS=6,11,15,19`.
+Since you're likely on mains power, the only cost of adding more is the panel's
+refresh flash. A single value (or the legacy `DAILY_REFRESH_HOUR`) gives the old
+once-a-day behavior.
+
+The Art Institute and the Met need no key. To add the Rijksmuseum to the art
+rotation, grab a free key from <https://www.rijksmuseum.nl/en/rijksstudio/my/api>
+and set `RIJKSMUSEUM_KEY` in `server/.env`. The sun/moon almanac is computed
+offline by the `astral` package (in `requirements.txt`) — no key or network.
 
 ### Running detached
 
