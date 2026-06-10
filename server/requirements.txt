@@ -3,3 +3,4 @@ Pillow>=10.0
 requests>=2.31
 python-dotenv>=1.0
 astral>=3.2
+anthropic>=0.25

@@ -207,6 +207,38 @@ def _draw_sun_moon(draw: ImageDraw.ImageDraw, sm: dict,
               f"{sm['moon_name']} {sm['moon_illum']}%", fill=BLACK, font=small)
 
 
+def _draw_insight_sidebar(draw: ImageDraw.ImageDraw, items: list[dict], sun_moon: dict | None) -> None:
+    """Sidebar variant for Claude-generated daily insight items (no year prefix)."""
+    sx0, sy0, sx1, sy1 = SIDEBAR
+    pad = 16
+
+    draw.text((sx0 + pad, sy0 + 10), "CURIOUS", fill=RED, font=_font(20))
+    cursor_y = sy0 + 40
+
+    chars_per_line = max(10, ((sx1 - sx0) - 2 * pad) // 8)
+    events_bottom = sy1 - (58 if sun_moon else 0)
+
+    if not items:
+        draw.text((sx0 + pad, cursor_y), "—", fill=BLACK, font=_font(16))
+    else:
+        item_font = _font(16)
+        for item in items:
+            if cursor_y > events_bottom - 28:
+                break
+            wrapped = textwrap.wrap(item["text"], width=chars_per_line)
+            for line in wrapped[:3]:
+                if cursor_y > events_bottom - 18:
+                    break
+                draw.text((sx0 + pad, cursor_y), line, fill=BLACK, font=item_font)
+                cursor_y += 18
+            cursor_y += 14
+
+    if sun_moon:
+        _draw_sun_moon(draw, sun_moon, sx0, sx1, sy1, pad)
+
+    draw.line([(sx0, sy0), (sx0, sy1)], fill=BLACK, width=1)
+
+
 def _draw_sidebar(draw: ImageDraw.ImageDraw, events: list[dict], sun_moon: dict | None) -> None:
     sx0, sy0, sx1, sy1 = SIDEBAR
     pad = 16
@@ -312,7 +344,6 @@ def render_rgb() -> Image.Image:
 
     hero = sources.get_hero()
     forecast = sources.get_forecast()
-    events = sources.get_on_this_day()
     sun_moon = sources.get_sun_moon()
 
     _draw_header(draw, hero)
@@ -325,7 +356,6 @@ def render_rgb() -> Image.Image:
         resized, pos = _fit_image_into(IMAGE_BOX, hero_image)
         img.paste(resized, pos)
     else:
-        # No image: gray-ish placeholder text.
         draw.text(
             (IMAGE_BOX[0] + 40, IMAGE_BOX[1] + 160),
             "Hero image unavailable",
@@ -333,7 +363,14 @@ def render_rgb() -> Image.Image:
             font=_font(28),
         )
 
-    _draw_sidebar(draw, events, sun_moon)
+    # Sidebar: prefer Claude insight; fall back to Wikipedia "On This Day".
+    insights = sources.get_daily_insight()
+    if insights:
+        _draw_insight_sidebar(draw, insights, sun_moon)
+    else:
+        events = sources.get_on_this_day()
+        _draw_sidebar(draw, events, sun_moon)
+
     _draw_forecast(draw, forecast)
 
     return img

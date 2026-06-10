@@ -1,4 +1,5 @@
 """Flask app: browser preview + raw frame buffer for the R4."""
+import logging
 import os
 import sys
 import threading
@@ -6,6 +7,12 @@ from datetime import datetime, timedelta
 from time import sleep, time
 
 from flask import Flask, Response, render_template_string
+
+# Suppress the "Bad file descriptor" noise logged when the R4 drops the TCP
+# connection mid-request — EBADF on a client socket is harmless.
+logging.getLogger("werkzeug").addFilter(
+    lambda r: "Bad file descriptor" not in r.getMessage()
+)
 
 import render
 import sources
