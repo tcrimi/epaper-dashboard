@@ -28,7 +28,7 @@ LAT = 40.7831
 LON = -73.9712
 LOCATION_LABEL = "NYC"
 
-USER_AGENT = "epaper-dashboard/0.1 (https://github.com/example/epaper-dashboard)"
+USER_AGENT = "epaper-dashboard/0.1 (https://github.com/tcrimi/epaper-dashboard)"
 
 # Grab one for free at https://api.nasa.gov — 1000 req/hr instead of DEMO_KEY's 30.
 NASA_API_KEY = os.environ.get("NASA_API_KEY", "DEMO_KEY")
@@ -159,6 +159,15 @@ _ART_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 _AIC_SEARCH = "https://api.artic.edu/api/v1/artworks/search"
 _AIC_IIIF = "https://www.artic.edu/iiif/2"
+# AIC asks API clients to identify themselves with a unique AIC-User-Agent that
+# includes contact info; unidentified clients are the ones its Fastly edge
+# throttles hardest, which is the source of the intermittent 403s. The contact
+# email lives in .env so it stays out of the repo.
+_AIC_CONTACT = os.environ.get("AIC_CONTACT_EMAIL")
+_AIC_HEADERS = {
+    **_ART_HEADERS,
+    "AIC-User-Agent": f"epaper-dashboard ({_AIC_CONTACT})" if _AIC_CONTACT else "epaper-dashboard",
+}
 # Elasticsearch caps `from + size` at 10000, so with 100 results/page only the
 # first 100 pages are reachable — plenty against ~60k public-domain works.
 _AIC_MAX_PAGE = 100
@@ -190,17 +199,20 @@ def _fetch_aic_art() -> dict[str, Any] | None:
         "limit": 100,
     }
     # Retry across a few random pages: a page may be light on image_ids, and AIC's
-    # edge occasionally 403s a burst request. Tolerate a per-attempt failure.
+    # edge occasionally 403s a burst request. Tolerate a per-attempt failure, and
+    # back off with jitter between tries so a throttle window has time to clear —
+    # three rapid hits all land in the same penalty window otherwise.
     iiif = _AIC_IIIF
     for attempt in range(3):
         params["page"] = random.randint(1, _AIC_MAX_PAGE)
         try:
-            r = requests.get(_AIC_SEARCH, params=params, timeout=_HTTP_TIMEOUT, headers=_ART_HEADERS)
+            r = requests.get(_AIC_SEARCH, params=params, timeout=_HTTP_TIMEOUT, headers=_AIC_HEADERS)
             r.raise_for_status()
             body = r.json()
         except Exception as e:
             print(f"[sources] AIC search attempt {attempt + 1} failed: {e}")
-            time.sleep(1)
+            if attempt < 2:
+                time.sleep(2 ** attempt + random.random())
             continue
         iiif = body.get("config", {}).get("iiif_url") or iiif
         with_images = [a for a in body.get("data", []) if a.get("image_id")]
