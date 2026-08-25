@@ -28,7 +28,15 @@ LAT = 40.7831
 LON = -73.9712
 LOCATION_LABEL = "NYC"
 
-USER_AGENT = "epaper-dashboard/0.1 (https://github.com/example/epaper-dashboard)"
+USER_AGENT = "epaper-dashboard/0.1 (https://github.com/tcrimi/epaper-dashboard; tcrimi@gmail.com)"
+
+# AIC's image CDN (www.artic.edu/iiif) 403s bot-looking User-Agents that carry a
+# URL, but serves browser-like ones. Image hosts want a browser UA; JSON APIs
+# (NWS, AIC search) want the identifying one above.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 # Grab one for free at https://api.nasa.gov — 1000 req/hr instead of DEMO_KEY's 30.
 NASA_API_KEY = os.environ.get("NASA_API_KEY", "DEMO_KEY")
@@ -140,7 +148,7 @@ def get_apod() -> dict[str, Any] | None:
 def download_image(url: str) -> Image.Image | None:
     """Download an image URL and return as a PIL RGB image. Cached by URL."""
     def fetch():
-        r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+        r = requests.get(url, timeout=30, headers={"User-Agent": BROWSER_UA})
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content)).convert("RGB")
         return img
@@ -155,7 +163,13 @@ def download_image(url: str) -> Image.Image | None:
 # make far better use of the Spectra 6 palette than the dark space photos APOD
 # often runs. The Art Institute and the Met need no key; Rijksmuseum joins the
 # pool only when RIJKSMUSEUM_KEY is set.
-_ART_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+# AIC asks clients to identify themselves via AIC-User-Agent (contact info),
+# and their edge 403s placeholder/example.com agents — send a real one.
+_ART_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "AIC-User-Agent": "epaper-dashboard (tcrimi@gmail.com)",
+    "Accept": "application/json",
+}
 
 _AIC_SEARCH = "https://api.artic.edu/api/v1/artworks/search"
 _AIC_IIIF = "https://www.artic.edu/iiif/2"
