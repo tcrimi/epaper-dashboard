@@ -3,6 +3,8 @@ from datetime import datetime
 from pathlib import Path
 import io
 import textwrap
+import time
+import threading
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -66,13 +68,22 @@ _FONT_CANDIDATES = [
 ]
 
 
+_font_cache: dict[int, ImageFont.ImageFont] = {}
+
+
 def _font(size: int) -> ImageFont.ImageFont:
-    for path in _FONT_CANDIDATES:
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
+    f = _font_cache.get(size)
+    if f is None:
+        for path in _FONT_CANDIDATES:
+            try:
+                f = ImageFont.truetype(path, size)
+                break
+            except OSError:
+                continue
+        if f is None:
+            f = ImageFont.load_default()
+        _font_cache[size] = f
+    return f
 
 
 _WI_FONT_PATH = Path(__file__).parent / "fonts" / "weathericons-regular-webfont.ttf"
@@ -337,6 +348,26 @@ def _draw_forecast(draw: ImageDraw.ImageDraw, forecast: list[dict]) -> None:
         draw.text((cx - tw / 2, fy0 + 70), temp_str, fill=temp_color, font=temp_font)
 
 
+# Cache the most recent quantized render. Two endpoints (preview.png, frame.bin)
+# both call render_quantized(); without this they each trigger a full PIL
+# pipeline independently. 60s TTL — data sources are already cached longer.
+_render_cache: dict[str, object] = {"ts": 0.0, "img": None}
+_render_lock = threading.Lock()
+_RENDER_TTL = 60.0
+
+
+def render_quantized_cached() -> Image.Image:
+    """Return a cached quantized render, refreshing if older than _RENDER_TTL."""
+    with _render_lock:
+        if time.time() - _render_cache["ts"] < _RENDER_TTL and _render_cache["img"] is not None:
+            return _render_cache["img"]  # type: ignore[return-value]
+    img = render_quantized()
+    with _render_lock:
+        _render_cache["ts"] = time.time()
+        _render_cache["img"] = img
+    return img
+
+
 def render_rgb() -> Image.Image:
     """Render the dashboard as a full-color RGB image — this is the source of truth."""
     img = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
@@ -363,13 +394,11 @@ def render_rgb() -> Image.Image:
             font=_font(28),
         )
 
-    # Sidebar: prefer Claude insight; fall back to Wikipedia "On This Day".
-    insights = sources.get_daily_insight()
-    if insights:
-        _draw_insight_sidebar(draw, insights, sun_moon)
+    sidebar = sources.get_sidebar_content()
+    if sidebar.get("source") == "insight":
+        _draw_insight_sidebar(draw, sidebar["items"], sun_moon)
     else:
-        events = sources.get_on_this_day()
-        _draw_sidebar(draw, events, sun_moon)
+        _draw_sidebar(draw, sidebar["items"], sun_moon)
 
     _draw_forecast(draw, forecast)
 
@@ -384,13 +413,13 @@ def render_quantized() -> Image.Image:
 def render_preview_png() -> bytes:
     """PNG bytes of the quantized image — what the browser shows."""
     buf = io.BytesIO()
-    render_quantized().convert("RGB").save(buf, format="PNG")
+    render_quantized_cached().convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
 
 
 def render_frame_bin() -> bytes:
     """800*480/2 = 192000 bytes, 4bpp packed, in Spectra 6 codes. What the R4 streams."""
-    q = render_quantized()
+    q = render_quantized_cached()
     pixels = q.tobytes()
 
     table = bytearray(256)

@@ -546,41 +546,43 @@ _INSIGHT_DOMAINS = [
 ]
 
 
-def _fetch_daily_insight() -> list[dict]:
+def _fetch_sidebar_content() -> dict:
+    """Ask Haiku to pick between today's Wikipedia OTD events and generated insight.
+    Returns {"source": "otd"|"insight", "items": [...]}.
+    Falls back to OTD without an API call if ANTHROPIC_API_KEY is not set."""
     import anthropic, json
 
+    events = get_on_this_day()
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        return []
+        return {"source": "otd", "items": events}
 
     today = datetime.now(APOD_TZ)
-    # Rotate domain daily so consecutive days land in different territory.
     domain, domain_hint = _INSIGHT_DOMAINS[today.timetuple().tm_yday % len(_INSIGHT_DOMAINS)]
+    events_text = "\n".join(f"- {e['year']}: {e['text']}" for e in events) if events else "(none)"
+
     prompt = (
         f"Today is {today.strftime('%A, %B %-d, %Y')}.\n\n"
-        "Write 2 items for a minimal wall-display sidebar.\n"
-        "Each item: 1–2 sentences, 90 characters maximum.\n\n"
-        f"Today's theme area: {domain} — specifically {domain_hint}.\n"
-        "Pick 2 different angles within or adjacent to that theme:\n"
-        "• word origin — the surprising etymology of a word in this area\n"
-        "• a number that reframes scale or time\n"
-        "• why something familiar is still the way it is\n"
-        "• a fact that sounds wrong but is true\n\n"
-        "Banned topics: octopus, the word 'muscle', salmon, "
-        "honey never spoiling, the word 'disaster'.\n"
-        "Find examples the reader almost certainly hasn't encountered. "
-        "No labels, headers, or theme names in the output.\n"
-        'Reply only with JSON: [{"text": "..."}, {"text": "..."}]'
+        f"Wikipedia 'On This Day' events:\n{events_text}\n\n"
+        "Choose what to show in a minimal wall-display sidebar:\n\n"
+        "Option A — use the Wikipedia events if at least one is genuinely interesting: "
+        "a pivotal moment, a surprising fact, something most people wouldn't know. "
+        "Pick the 2 best and return them unchanged as {\"year\": ..., \"text\": \"...\"} objects.\n\n"
+        "Option B — if the events are mundane, generate 2 curious facts instead. "
+        f"Theme: {domain} — {domain_hint}. Each fact: 1–2 sentences, 90 chars max. "
+        "Banned: octopus, the word 'muscle', salmon, honey never spoiling, the word 'disaster'. "
+        "No labels or headers in the text.\n\n"
+        'Reply only with JSON: {"source": "otd", "items": [{"year": ..., "text": "..."}]} '
+        'or {"source": "insight", "items": [{"text": "..."}]}'
     )
 
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
+        max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = msg.content[0].text.strip()
-    # Strip markdown code fences if the model wraps its JSON.
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -588,12 +590,15 @@ def _fetch_daily_insight() -> list[dict]:
     return json.loads(raw.strip())
 
 
-def get_daily_insight() -> list[dict]:
-    """Two Claude-generated sidebar items, cached for the day.
-    Returns [] if ANTHROPIC_API_KEY is not set."""
-    import json  # noqa: F401 — imported inside _fetch_daily_insight too
+def get_sidebar_content() -> dict:
+    """Sidebar content for the day, Haiku-curated.
+    Returns {"source": "otd"|"insight", "items": [...]}."""
+    import json  # noqa: F401
     today = datetime.now(APOD_TZ).strftime("%Y-%m-%d")
-    return _cached(f"insight:{today}", ttl_seconds=12 * 3600, fn=_fetch_daily_insight) or []
+    result = _cached(f"sidebar:{today}", ttl_seconds=6 * 3600, fn=_fetch_sidebar_content)
+    if not result:
+        return {"source": "otd", "items": get_on_this_day()}
+    return result
 
 
 # ---------------------------- Startup ----------------------------
@@ -608,8 +613,6 @@ def warmup() -> None:
     refresh_hero(datetime.now(APOD_TZ).hour)
     print("[sources] warmup: forecast...", flush=True)
     get_forecast()
-    print("[sources] warmup: on-this-day...", flush=True)
-    get_on_this_day()
-    print("[sources] warmup: daily insight...", flush=True)
-    get_daily_insight()
+    print("[sources] warmup: sidebar...", flush=True)
+    get_sidebar_content()
     print("[sources] warmup complete", flush=True)

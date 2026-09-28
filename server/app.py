@@ -143,4 +143,4 @@ if __name__ == "__main__":
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         sources.warmup()
         threading.Thread(target=_prewarm_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=debug)
+    app.run(host="0.0.0.0", port=PORT, debug=debug, threaded=True)
