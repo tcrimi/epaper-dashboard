@@ -1,4 +1,5 @@
 #include <WiFiS3.h>
+#include <WiFiUdp.h>
 #include "Arduino_LED_Matrix.h"
 #include "secrets.h"
 #include "src/Config/DEV_Config.h"
@@ -7,8 +8,14 @@
 #define FRAME_BYTES        (EPD_7IN3E_WIDTH * EPD_7IN3E_HEIGHT / 2)
 #define DEFAULT_REFRESH_MS (24UL * 60UL * 60UL * 1000UL)
 #define MIN_REFRESH_MS     (60UL * 1000UL)
+// After a failed refresh, retry on a short backoff (1, 2, 4 … capped at 30 min)
+// instead of waiting out the previous multi-hour interval — otherwise one miss
+// (server asleep, WiFi hiccup) pushes the next attempt hours off schedule.
+#define RETRY_BASE_MS      (60UL * 1000UL)
+#define RETRY_MAX_MS       (30UL * 60UL * 1000UL)
 
 static unsigned long nextRefreshDelayMs = DEFAULT_REFRESH_MS;
+static uint8_t       failedRefreshes    = 0;
 
 WiFiClient wifi;
 ArduinoLEDMatrix matrix;
@@ -218,6 +225,9 @@ static bool connectWiFi() {
     Serial.print(WIFI_SSID);
     Serial.println("'");
 
+    // Drop any half-dead association first; WiFiS3 can report CONNECTED on a
+    // link that no longer passes traffic, and begin() on top of it can stall.
+    WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     const unsigned long deadline = millis() + 20000;
@@ -240,6 +250,47 @@ static bool connectWiFi() {
     Serial.println(WiFi.localIP());
     return false;
 }
+
+// ─── Wake-on-LAN ──────────────────────────────────────────────────────────────
+// If the server machine sleeps between refreshes, a magic packet (6×0xFF then
+// the target MAC ×16, UDP to the subnet broadcast) wakes it before we connect.
+// Define SERVER_MAC in secrets.h to enable, e.g. {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF}.
+#ifdef SERVER_MAC
+
+#define WOL_PORT     9
+#define WOL_WAKE_MS  8000UL   // time for the server to finish waking
+
+static void wakeServer() {
+    static const uint8_t mac[6] = SERVER_MAC;
+    uint8_t packet[102];
+    memset(packet, 0xFF, 6);
+    for (int i = 0; i < 16; i++) memcpy(packet + 6 + i * 6, mac, 6);
+
+    IPAddress ip = WiFi.localIP(), mask = WiFi.subnetMask(), bcast;
+    for (int i = 0; i < 4; i++) bcast[i] = ip[i] | (uint8_t)~mask[i];
+
+    WiFiUDP udp;
+    udp.begin(WOL_PORT);
+    for (int i = 0; i < 3; i++) {   // UDP is lossy; a few copies is customary
+        udp.beginPacket(bcast, WOL_PORT);
+        udp.write(packet, sizeof(packet));
+        udp.endPacket();
+        delay(100);
+    }
+    udp.stop();
+    Serial.print("WoL: sent to ");
+    Serial.println(bcast);
+
+    const unsigned long start = millis();
+    while (millis() - start < WOL_WAKE_MS) {
+        animTick();
+        delay(50);
+    }
+}
+
+#else
+static void wakeServer() {}
+#endif
 
 // ─── HTTP fetch + SPI stream ──────────────────────────────────────────────────
 
@@ -347,27 +398,45 @@ static bool fetchAndStream() {
 
 static unsigned long lastRefreshAt = 0;
 
+static void scheduleRetry() {
+    unsigned long delayMs = RETRY_BASE_MS << min(failedRefreshes, (uint8_t)5);
+    if (delayMs > RETRY_MAX_MS) delayMs = RETRY_MAX_MS;
+    if (failedRefreshes < 255) failedRefreshes++;
+    nextRefreshDelayMs = delayMs;
+    Serial.print("refresh: retry #");
+    Serial.print(failedRefreshes);
+    Serial.print(" in ");
+    Serial.print(delayMs / 1000);
+    Serial.println("s");
+}
+
 static void doRefresh() {
     Serial.println("refresh: starting");
 
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("refresh: WiFi dropped, reconnecting");
+    // A failed fetch last time may mean the link is stale even if status says
+    // CONNECTED, so force a fresh association on retries.
+    if (WiFi.status() != WL_CONNECTED || failedRefreshes > 0) {
+        Serial.println("refresh: (re)connecting WiFi");
         connectWiFi();
     }
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("refresh: skipped — no WiFi");
+        scheduleRetry();
         lastRefreshAt = millis();
         return;
     }
 
+    wakeServer();
     EPD_7IN3E_Init();
 
     bool ok = fetchAndStream();
     if (ok) {
         animStart();  // reset animation as a visual "refresh complete" cue
         EPD_7IN3E_TurnOnDisplay();
+        failedRefreshes = 0;
     } else {
-        Serial.println("refresh: skipped — partial frame");
+        Serial.println("refresh: skipped — fetch failed");
+        scheduleRetry();
     }
     // CRITICAL: sleep the panel immediately. Leaving driver transistors energised
     // destroys the diaphragm within months.
@@ -396,8 +465,9 @@ void setup() {
     if (wifiOk) {
         doRefresh();
     } else {
-        Serial.println("setup: no WiFi, will retry on next interval");
+        Serial.println("setup: no WiFi, will retry shortly");
         lastRefreshAt = millis();
+        scheduleRetry();
     }
 }
 

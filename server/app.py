@@ -52,9 +52,14 @@ def _next_refresh(now: datetime) -> datetime:
 
 
 def ms_until_next_refresh() -> int:
-    """Milliseconds from now until the next REFRESH_HOURS boundary."""
+    """Milliseconds from now until the next REFRESH_HOURS boundary.
+
+    The board's clock drifts, so it can arrive a little before a boundary. Skip
+    any boundary within a couple of minutes — otherwise we'd answer a few
+    seconds, which the board rejects (60 s floor) and keeps its stale delay.
+    """
     now = datetime.now()
-    return int((_next_refresh(now) - now).total_seconds() * 1000)
+    return int((_next_refresh(now + timedelta(minutes=2)) - now).total_seconds() * 1000)
 
 
 def _prewarm_loop() -> None:
@@ -143,4 +148,4 @@ if __name__ == "__main__":
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         sources.warmup()
         threading.Thread(target=_prewarm_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=debug)
+    app.run(host="0.0.0.0", port=PORT, debug=debug, threaded=True)

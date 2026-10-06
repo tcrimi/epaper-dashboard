@@ -28,7 +28,7 @@ LAT = 40.7831
 LON = -73.9712
 LOCATION_LABEL = "NYC"
 
-USER_AGENT = "epaper-dashboard/0.1 (https://github.com/tcrimi/epaper-dashboard; tcrimi@gmail.com)"
+USER_AGENT = "epaper-dashboard/0.1 (https://github.com/tcrimi/epaper-dashboard)"
 
 # AIC's image CDN (www.artic.edu/iiif) 403s bot-looking User-Agents that carry a
 # URL, but serves browser-like ones. Image hosts want a browser UA; JSON APIs
@@ -163,16 +163,19 @@ def download_image(url: str) -> Image.Image | None:
 # make far better use of the Spectra 6 palette than the dark space photos APOD
 # often runs. The Art Institute and the Met need no key; Rijksmuseum joins the
 # pool only when RIJKSMUSEUM_KEY is set.
-# AIC asks clients to identify themselves via AIC-User-Agent (contact info),
-# and their edge 403s placeholder/example.com agents — send a real one.
-_ART_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "AIC-User-Agent": "epaper-dashboard (tcrimi@gmail.com)",
-    "Accept": "application/json",
-}
+_ART_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 _AIC_SEARCH = "https://api.artic.edu/api/v1/artworks/search"
 _AIC_IIIF = "https://www.artic.edu/iiif/2"
+# AIC asks API clients to identify themselves with a unique AIC-User-Agent that
+# includes contact info; unidentified clients are the ones its Fastly edge
+# throttles hardest, which is the source of the intermittent 403s. The contact
+# email lives in .env so it stays out of the repo.
+_AIC_CONTACT = os.environ.get("AIC_CONTACT_EMAIL")
+_AIC_HEADERS = {
+    **_ART_HEADERS,
+    "AIC-User-Agent": f"epaper-dashboard ({_AIC_CONTACT})" if _AIC_CONTACT else "epaper-dashboard",
+}
 # Elasticsearch caps `from + size` at 10000, so with 100 results/page only the
 # first 100 pages are reachable — plenty against ~60k public-domain works.
 _AIC_MAX_PAGE = 100
@@ -204,17 +207,20 @@ def _fetch_aic_art() -> dict[str, Any] | None:
         "limit": 100,
     }
     # Retry across a few random pages: a page may be light on image_ids, and AIC's
-    # edge occasionally 403s a burst request. Tolerate a per-attempt failure.
+    # edge occasionally 403s a burst request. Tolerate a per-attempt failure, and
+    # back off with jitter between tries so a throttle window has time to clear —
+    # three rapid hits all land in the same penalty window otherwise.
     iiif = _AIC_IIIF
     for attempt in range(3):
         params["page"] = random.randint(1, _AIC_MAX_PAGE)
         try:
-            r = requests.get(_AIC_SEARCH, params=params, timeout=_HTTP_TIMEOUT, headers=_ART_HEADERS)
+            r = requests.get(_AIC_SEARCH, params=params, timeout=_HTTP_TIMEOUT, headers=_AIC_HEADERS)
             r.raise_for_status()
             body = r.json()
         except Exception as e:
             print(f"[sources] AIC search attempt {attempt + 1} failed: {e}")
-            time.sleep(1)
+            if attempt < 2:
+                time.sleep(2 ** attempt + random.random())
             continue
         iiif = body.get("config", {}).get("iiif_url") or iiif
         with_images = [a for a in body.get("data", []) if a.get("image_id")]
@@ -548,41 +554,43 @@ _INSIGHT_DOMAINS = [
 ]
 
 
-def _fetch_daily_insight() -> list[dict]:
+def _fetch_sidebar_content() -> dict:
+    """Ask Haiku to pick between today's Wikipedia OTD events and generated insight.
+    Returns {"source": "otd"|"insight", "items": [...]}.
+    Falls back to OTD without an API call if ANTHROPIC_API_KEY is not set."""
     import anthropic, json
 
+    events = get_on_this_day()
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        return []
+        return {"source": "otd", "items": events}
 
     today = datetime.now(APOD_TZ)
-    # Rotate domain daily so consecutive days land in different territory.
     domain, domain_hint = _INSIGHT_DOMAINS[today.timetuple().tm_yday % len(_INSIGHT_DOMAINS)]
+    events_text = "\n".join(f"- {e['year']}: {e['text']}" for e in events) if events else "(none)"
+
     prompt = (
         f"Today is {today.strftime('%A, %B %-d, %Y')}.\n\n"
-        "Write 2 items for a minimal wall-display sidebar.\n"
-        "Each item: 1–2 sentences, 90 characters maximum.\n\n"
-        f"Today's theme area: {domain} — specifically {domain_hint}.\n"
-        "Pick 2 different angles within or adjacent to that theme:\n"
-        "• word origin — the surprising etymology of a word in this area\n"
-        "• a number that reframes scale or time\n"
-        "• why something familiar is still the way it is\n"
-        "• a fact that sounds wrong but is true\n\n"
-        "Banned topics: octopus, the word 'muscle', salmon, "
-        "honey never spoiling, the word 'disaster'.\n"
-        "Find examples the reader almost certainly hasn't encountered. "
-        "No labels, headers, or theme names in the output.\n"
-        'Reply only with JSON: [{"text": "..."}, {"text": "..."}]'
+        f"Wikipedia 'On This Day' events:\n{events_text}\n\n"
+        "Choose what to show in a minimal wall-display sidebar:\n\n"
+        "Option A — use the Wikipedia events if at least one is genuinely interesting: "
+        "a pivotal moment, a surprising fact, something most people wouldn't know. "
+        "Pick the 2 best and return them unchanged as {\"year\": ..., \"text\": \"...\"} objects.\n\n"
+        "Option B — if the events are mundane, generate 2 curious facts instead. "
+        f"Theme: {domain} — {domain_hint}. Each fact: 1–2 sentences, 90 chars max. "
+        "Banned: octopus, the word 'muscle', salmon, honey never spoiling, the word 'disaster'. "
+        "No labels or headers in the text.\n\n"
+        'Reply only with JSON: {"source": "otd", "items": [{"year": ..., "text": "..."}]} '
+        'or {"source": "insight", "items": [{"text": "..."}]}'
     )
 
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
+        max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = msg.content[0].text.strip()
-    # Strip markdown code fences if the model wraps its JSON.
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -590,12 +598,15 @@ def _fetch_daily_insight() -> list[dict]:
     return json.loads(raw.strip())
 
 
-def get_daily_insight() -> list[dict]:
-    """Two Claude-generated sidebar items, cached for the day.
-    Returns [] if ANTHROPIC_API_KEY is not set."""
-    import json  # noqa: F401 — imported inside _fetch_daily_insight too
+def get_sidebar_content() -> dict:
+    """Sidebar content for the day, Haiku-curated.
+    Returns {"source": "otd"|"insight", "items": [...]}."""
+    import json  # noqa: F401
     today = datetime.now(APOD_TZ).strftime("%Y-%m-%d")
-    return _cached(f"insight:{today}", ttl_seconds=12 * 3600, fn=_fetch_daily_insight) or []
+    result = _cached(f"sidebar:{today}", ttl_seconds=6 * 3600, fn=_fetch_sidebar_content)
+    if not result:
+        return {"source": "otd", "items": get_on_this_day()}
+    return result
 
 
 # ---------------------------- Startup ----------------------------
@@ -610,8 +621,6 @@ def warmup() -> None:
     refresh_hero(datetime.now(APOD_TZ).hour)
     print("[sources] warmup: forecast...", flush=True)
     get_forecast()
-    print("[sources] warmup: on-this-day...", flush=True)
-    get_on_this_day()
-    print("[sources] warmup: daily insight...", flush=True)
-    get_daily_insight()
+    print("[sources] warmup: sidebar...", flush=True)
+    get_sidebar_content()
     print("[sources] warmup complete", flush=True)
