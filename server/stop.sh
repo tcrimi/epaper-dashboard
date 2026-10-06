@@ -13,13 +13,15 @@ if launchctl list "$LABEL" &>/dev/null 2>&1; then
     launchctl kill SIGTERM "gui/$(id -u)/$LABEL" 2>/dev/null
     echo "stopped ($LABEL)"
 else
-    # Not managed by launchd — kill by port + caffeinate wrapper.
-    pids=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN)
-    cafe_pids=$(pgrep -f "caffeinate.*app.py" 2>/dev/null)
-    all_pids=$(echo "$pids $cafe_pids" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-    if [ -n "$(echo $all_pids | tr -d ' ')" ]; then
-        kill $all_pids 2>/dev/null && echo "stopped (port $PORT)"
-    else
-        echo "nothing listening on port $PORT"
-    fi
+    # Not managed by launchd — kill by port. PORT is the relay (board-facing);
+    # FLASK_PORT is app.py behind it.
+    FLASK_PORT="${FLASK_PORT:-5012}"
+    for p in "$PORT" "$FLASK_PORT"; do
+        pids=$(lsof -tiTCP:"$p" -sTCP:LISTEN)
+        if [ -n "$pids" ]; then
+            kill $pids && echo "stopped (port $p)"
+        else
+            echo "nothing listening on port $p"
+        fi
+    done
 fi

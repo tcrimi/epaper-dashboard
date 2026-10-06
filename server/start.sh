@@ -22,7 +22,25 @@ if [ ! -f .venv/bin/activate ]; then
 fi
 source .venv/bin/activate
 
-# caffeinate -i keeps the machine from idle-sleeping so the R4's requests don't
-# stall waiting for a wake — it exits automatically when the server process does.
-FLASK_DEBUG=0 nohup caffeinate -i python3 app.py > server.log 2>&1 < /dev/null &
-echo "started (pid $!), logging to server.log"
+# The macOS app firewall blocks inbound connections to the Homebrew Python that
+# runs app.py, so the board can't reach Flask directly. relay.py takes over
+# PORT -- the port the board already targets -- and forwards to Flask on
+# FLASK_PORT over loopback, which the firewall doesn't filter. That keeps the
+# firmware pointed at the same port it always was.
+PORT="${PORT:-$(grep -E '^\s*PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')}"
+PORT="${PORT:-5000}"
+FLASK_PORT="${FLASK_PORT:-5012}"
+
+# PORT is set inline so it wins over .env: python-dotenv does not override
+# variables already present in the environment.
+PORT="$FLASK_PORT" FLASK_DEBUG=0 nohup python3 app.py > server.log 2>&1 < /dev/null &
+echo "started (pid $!) on internal port $FLASK_PORT, logging to server.log"
+
+# /usr/bin/python3 is allowlisted by the firewall; use that absolute path,
+# because the venv's python3 on PATH is the blocked interpreter.
+if lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "relay already running on port $PORT"
+else
+    FLASK_PORT="$FLASK_PORT" nohup /usr/bin/python3 relay.py > relay.log 2>&1 < /dev/null &
+    echo "relay started (pid $!) on port $PORT, logging to relay.log"
+fi

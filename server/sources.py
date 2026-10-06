@@ -176,9 +176,24 @@ _AIC_HEADERS = {
     **_ART_HEADERS,
     "AIC-User-Agent": f"epaper-dashboard ({_AIC_CONTACT})" if _AIC_CONTACT else "epaper-dashboard",
 }
-# Elasticsearch caps `from + size` at 10000, so with 100 results/page only the
-# first 100 pages are reachable — plenty against ~60k public-domain works.
-_AIC_MAX_PAGE = 100
+# Search caps offset + limit at 1000, not the 10000 Elasticsearch allows: past
+# page 10 at limit=100 it 403s "Invalid number of results". The plain /artworks
+# listing pages uncapped but is ordered by accession, so whole pages come back
+# as glass or prints and barely 1 in 200 is a painting. So filter to
+# public-domain paintings through the ES DSL (1868 of them, needs POST — GET
+# takes only one query[term]) and stay inside the cap. AIC ignores
+# function_score, so there is no server-side shuffle: draw a random page of the
+# reachable 1000 and a random work from it.
+_AIC_MAX_PAGE = 10
+_AIC_QUERY = {
+    "bool": {
+        "filter": [
+            {"term": {"is_public_domain": True}},
+            {"term": {"artwork_type_title.keyword": "Painting"}},
+            {"exists": {"field": "image_id"}},
+        ]
+    }
+}
 
 # The Met's European Paintings department — a curated, high-color subset.
 _MET_DEPT = 11
@@ -200,21 +215,21 @@ def _art_payload(title: str | None, artist: str | None, url: str) -> dict[str, A
 
 
 def _fetch_aic_art() -> dict[str, Any] | None:
-    """Random public-domain artwork from the Art Institute of Chicago (no key)."""
-    params = {
-        "query[term][is_public_domain]": "true",
-        "fields": "id,title,image_id,artist_title",
+    """Random public-domain painting from the Art Institute of Chicago (no key)."""
+    query = {
+        "query": _AIC_QUERY,
+        "fields": ["id", "title", "image_id", "artist_title"],
         "limit": 100,
     }
-    # Retry across a few random pages: a page may be light on image_ids, and AIC's
-    # edge occasionally 403s a burst request. Tolerate a per-attempt failure, and
-    # back off with jitter between tries so a throttle window has time to clear —
-    # three rapid hits all land in the same penalty window otherwise.
+    # Retry across a few random pages: AIC's edge occasionally 403s a burst
+    # request. Tolerate a per-attempt failure, and back off with jitter between
+    # tries so a throttle window has time to clear — three rapid hits all land
+    # in the same penalty window otherwise.
     iiif = _AIC_IIIF
     for attempt in range(3):
-        params["page"] = random.randint(1, _AIC_MAX_PAGE)
+        query["page"] = random.randint(1, _AIC_MAX_PAGE)
         try:
-            r = requests.get(_AIC_SEARCH, params=params, timeout=_HTTP_TIMEOUT, headers=_AIC_HEADERS)
+            r = requests.post(_AIC_SEARCH, json=query, timeout=_HTTP_TIMEOUT, headers=_AIC_HEADERS)
             r.raise_for_status()
             body = r.json()
         except Exception as e:

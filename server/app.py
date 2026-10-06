@@ -1,5 +1,5 @@
 """Flask app: browser preview + raw frame buffer for the R4."""
-import logging
+import errno
 import os
 import sys
 import threading
@@ -7,12 +7,23 @@ from datetime import datetime, timedelta
 from time import sleep, time
 
 from flask import Flask, Response, render_template_string
+from werkzeug.serving import BaseWSGIServer
 
-# Suppress the "Bad file descriptor" noise logged when the R4 drops the TCP
-# connection mid-request — EBADF on a client socket is harmless.
-logging.getLogger("werkzeug").addFilter(
-    lambda r: "Bad file descriptor" not in r.getMessage()
-)
+# Suppress the EBADF traceback spam from connections torn down before their
+# request line arrives. Werkzeug's handler catches only ConnectionError and
+# socket.timeout, so OSError(EBADF) escapes to socketserver's handle_error --
+# which prints straight to stderr, where no logging filter can reach it.
+_orig_handle_error = BaseWSGIServer.handle_error
+
+
+def _quiet_handle_error(self, request, client_address):
+    exc = sys.exc_info()[1]
+    if isinstance(exc, OSError) and exc.errno == errno.EBADF:
+        return
+    _orig_handle_error(self, request, client_address)
+
+
+BaseWSGIServer.handle_error = _quiet_handle_error
 
 import render
 import sources

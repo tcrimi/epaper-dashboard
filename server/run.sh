@@ -8,4 +8,4 @@ if [ ! -f .venv/bin/activate ]; then
     /opt/homebrew/bin/uv pip install -r requirements.txt --python .venv/bin/python
 fi
 
-exec caffeinate -i .venv/bin/python3 app.py
+exec .venv/bin/python3 app.py
