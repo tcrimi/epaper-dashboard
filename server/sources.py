@@ -147,8 +147,15 @@ def get_apod() -> dict[str, Any] | None:
 
 def download_image(url: str) -> Image.Image | None:
     """Download an image URL and return as a PIL RGB image. Cached by URL."""
+    # AIC's Cloudflare edge challenges IIIF image requests that lack the
+    # AIC-User-Agent header, so send the same identification the API gets —
+    # alongside the browser UA, since the CDN 403s a bot-looking User-Agent.
+    headers = {"User-Agent": BROWSER_UA}
+    if url.startswith(_AIC_IIIF_HOST):
+        headers["AIC-User-Agent"] = _AIC_HEADERS["AIC-User-Agent"]
+
     def fetch():
-        r = requests.get(url, timeout=30, headers={"User-Agent": BROWSER_UA})
+        r = requests.get(url, timeout=30, headers=headers)
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content)).convert("RGB")
         return img
@@ -167,6 +174,7 @@ _ART_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 _AIC_SEARCH = "https://api.artic.edu/api/v1/artworks/search"
 _AIC_IIIF = "https://www.artic.edu/iiif/2"
+_AIC_IIIF_HOST = "https://www.artic.edu/"
 # AIC asks API clients to identify themselves with a unique AIC-User-Agent that
 # includes contact info; unidentified clients are the ones its Fastly edge
 # throttles hardest, which is the source of the intermittent 403s. The contact
@@ -204,13 +212,13 @@ _RIJKS_COLLECTION = "https://www.rijksmuseum.nl/api/en/collection"
 _RIJKS_MAX_PAGE = 100  # ps=100, and p*ps must stay <= 10000
 
 
-def _art_payload(title: str | None, artist: str | None, url: str) -> dict[str, Any]:
+def _art_payload(title: str | None, artist: str | None, url: str) -> dict[str, Any] | None:
     """Shape a hero payload like the APOD dict (title/artist/url) and prewarm the
-    image so the next render doesn't block on the download."""
-    try:
-        download_image(url)
-    except Exception as e:
-        print(f"[sources] art image prewarm failed: {e}")
+    image so the next render doesn't block on the download. Returns None if the
+    image can't be fetched, so the caller falls through to another source rather
+    than publishing a hero the board can't draw."""
+    if download_image(url) is None:
+        return None
     return {"title": title or "Untitled", "artist": artist or None, "url": url}
 
 
@@ -342,12 +350,16 @@ _current_hero: dict[str, Any] | None = None
 def select_hero(hour: int) -> dict[str, Any] | None:
     """Pick the hero for a given wake hour: the day's APOD in the morning,
     rotating museum art from ART_FROM_HOUR on. Falls back to APOD if art can't be
-    fetched, so the board always has a hero. Both paths prewarm the image."""
+    fetched (and vice versa when APOD is down), so the board always has a hero.
+    Both paths prewarm the image."""
     if hour >= ART_FROM_HOUR:
         art = _fetch_museum_art()
         if art:
             return art
-    return get_apod()  # get_apod prewarms its own image
+    apod = get_apod()  # get_apod prewarms its own image
+    if apod and apod.get("url") and download_image(apod["url"]) is not None:
+        return apod
+    return _fetch_museum_art()
 
 
 def refresh_hero(hour: int) -> dict[str, Any] | None:
