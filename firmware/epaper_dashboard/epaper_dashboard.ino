@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
 #include "Arduino_LED_Matrix.h"
@@ -292,6 +293,66 @@ static void wakeServer() {
 static void wakeServer() {}
 #endif
 
+// ─── Remote failure log ───────────────────────────────────────────────────────
+// The board usually runs without a serial console, so failures are POSTed to
+// the server's /log endpoint (appended to server/board.log). A report that
+// can't be delivered — e.g. WiFi itself is down — stays pending and goes out
+// before the next fetch. One slot: a newer failure replaces an unsent one.
+
+static char failReason[200];
+static bool reportPending = true;   // first report announces the boot
+
+static void setFailure(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(failReason, sizeof(failReason), fmt, ap);
+    va_end(ap);
+    Serial.print("fail: ");
+    Serial.println(failReason);
+    reportPending = true;
+}
+
+static void sendReport() {
+    if (!reportPending || WiFi.status() != WL_CONNECTED) return;
+
+    char body[320];
+    int n = snprintf(body, sizeof(body),
+                     "%s uptime_s=%lu fails=%u rssi=%ld",
+                     failReason[0] ? failReason : "boot",
+                     millis() / 1000, failedRefreshes, (long)WiFi.RSSI());
+
+    WiFiClient c;
+    if (!c.connect(SERVER_HOST, SERVER_PORT)) {
+        Serial.println("log: connect failed, keeping report");
+        return;
+    }
+    c.print("POST /log HTTP/1.1\r\nHost: ");
+    c.print(SERVER_HOST);
+    c.print("\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: ");
+    c.print(n);
+    c.print("\r\n\r\n");
+    c.print(body);
+
+    // Only drop the report once the server acknowledges it.
+    String status;
+    const unsigned long deadline = millis() + 5000;
+    while (millis() < deadline && (c.connected() || c.available())) {
+        if (c.available() <= 0) { delay(1); continue; }
+        char ch = (char)c.read();
+        if (ch == '\n') break;
+        status += ch;
+    }
+    c.stop();
+    if (status.indexOf(" 20") >= 0) {
+        reportPending = false;
+        failReason[0] = '\0';
+        Serial.println("log: report sent");
+    } else {
+        Serial.print("log: not acknowledged: ");
+        Serial.println(status);
+    }
+}
+
 // ─── HTTP fetch + SPI stream ──────────────────────────────────────────────────
 
 // The server renders the frame inside the request handler, so the first
@@ -331,9 +392,10 @@ static bool fetchAndStream() {
     Serial.println("/frame.bin");
 
     if (!wifi.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.println("HTTP: connect failed");
+        setFailure("connect failed");
         return false;
     }
+    const unsigned long requestAt = millis();
 
     wifi.print("GET /frame.bin HTTP/1.1\r\nHost: ");
     wifi.print(SERVER_HOST);
@@ -341,8 +403,8 @@ static bool fetchAndStream() {
 
     String line;
     if (!readHeaderLine(line) || line.indexOf(" 200") < 0) {
-        Serial.print("HTTP: bad status line: ");
-        Serial.println(line);
+        setFailure("bad status line after %lums: '%.80s'",
+                   millis() - requestAt, line.c_str());
         wifi.stop();
         return false;
     }
@@ -360,15 +422,17 @@ static bool fetchAndStream() {
         }
     }
     if (!headersDone) {
-        Serial.println("HTTP: headers truncated");
+        setFailure("headers truncated after %lums", millis() - requestAt);
         wifi.stop();
         return false;
     }
 
     EPD_7IN3E_SendCommand(0x10);
 
+    const unsigned long bodyAt = millis();
     long got = 0;
     unsigned long lastByteAt = millis();
+    const char *stopReason = "complete";
     while (got < FRAME_BYTES) {
         int avail = wifi.available();
         if (avail > 0) {
@@ -378,9 +442,10 @@ static bool fetchAndStream() {
             }
             lastByteAt = millis();
         } else if (!wifi.connected()) {
+            stopReason = "closed";
             break;
         } else if (millis() - lastByteAt > 10000) {
-            Serial.println("HTTP: stalled, giving up");
+            stopReason = "stalled";
             break;
         }
         animTick();
@@ -391,7 +456,13 @@ static bool fetchAndStream() {
     Serial.print(got);
     Serial.print(" / ");
     Serial.println(FRAME_BYTES);
-    return got == FRAME_BYTES;
+    if (got != FRAME_BYTES) {
+        setFailure("body %s at %ld/%ld bytes; headers %lums, body %lums",
+                   stopReason, got, (long)FRAME_BYTES,
+                   bodyAt - requestAt, millis() - bodyAt);
+        return false;
+    }
+    return true;
 }
 
 // ─── Refresh cycle ────────────────────────────────────────────────────────────
@@ -421,12 +492,14 @@ static void doRefresh() {
     }
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("refresh: skipped — no WiFi");
+        setFailure("no WiFi, status=%s", wifiStatusStr(WiFi.status()));
         scheduleRetry();
         lastRefreshAt = millis();
         return;
     }
 
     wakeServer();
+    sendReport();   // anything that couldn't be delivered last time
     EPD_7IN3E_Init();
 
     bool ok = fetchAndStream();
@@ -441,6 +514,7 @@ static void doRefresh() {
     // CRITICAL: sleep the panel immediately. Leaving driver transistors energised
     // destroys the diaphragm within months.
     EPD_7IN3E_Sleep();
+    sendReport();
 
     lastRefreshAt = millis();
     Serial.println("refresh: done");

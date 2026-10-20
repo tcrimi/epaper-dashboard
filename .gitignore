@@ -8,3 +8,4 @@ nohup.out
 server.log
 relay.log
 firmware/epaper_dashboard/secrets.h
+board.log

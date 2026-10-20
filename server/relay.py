@@ -20,6 +20,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -56,21 +57,30 @@ TIMEOUT = float(os.environ.get("RELAY_TIMEOUT", "120"))
 BUF = 65536
 
 
-def _pump(src, dst):
-    """Copy src -> dst until EOF, then half-close dst so it sees the EOF too."""
+def _pump(src, dst, result=None):
+    """Copy src -> dst until EOF, then half-close dst so it sees the EOF too.
+
+    Returns (bytes copied, error or None); also stored in `result` if given,
+    for the thread-run direction.
+    """
+    total, err = 0, None
     try:
         while True:
             chunk = src.recv(BUF)
             if not chunk:
                 break
             dst.sendall(chunk)
-    except OSError:
-        pass  # peer vanished mid-transfer; the finally below still half-closes
+            total += len(chunk)
+    except OSError as e:
+        err = e  # peer vanished mid-transfer; the finally below still half-closes
     finally:
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+    if result is not None:
+        result.extend((total, err))
+    return total, err
 
 
 def _handle(client, addr):
@@ -87,10 +97,19 @@ def _handle(client, addr):
         # Pump each direction on its own thread so they can close
         # independently: the board half-closes after its request, then reads
         # 192000 bytes of frame back.
-        up = threading.Thread(target=_pump, args=(client, upstream), daemon=True)
+        started = time.time()
+        sent_up = []
+        up = threading.Thread(target=_pump, args=(client, upstream, sent_up),
+                              daemon=True)
         up.start()
-        _pump(upstream, client)
+        sent_down, err = _pump(upstream, client)
         up.join()
+        # One line per connection: a short byte count or an error here means
+        # the frame never fully left this machine.
+        print("[relay] %s:%d up=%dB down=%dB %.1fs%s"
+              % (addr[0], addr[1], sent_up[0] if sent_up else 0, sent_down,
+                 time.time() - started, " error=%s" % err if err else ""),
+              flush=True)
     finally:
         client.close()
         upstream.close()

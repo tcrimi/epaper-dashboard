@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timedelta
 from time import sleep, time
 
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request
 from werkzeug.serving import BaseWSGIServer
 
 # Suppress the EBADF traceback spam from connections torn down before their
@@ -119,7 +119,8 @@ INDEX_HTML = """<!doctype html>
   </div>
   <p class="meta">
     Quantized to Spectra 6 with Floyd-Steinberg dither &middot;
-    <a href="/frame.bin">/frame.bin</a> (192000 bytes, 4bpp) is what the R4 fetches
+    <a href="/frame.bin">/frame.bin</a> (192000 bytes, 4bpp) is what the R4 fetches &middot;
+    <a href="/log">board log</a>
   </p>
 </body>
 </html>
@@ -134,6 +135,30 @@ def index():
 @app.route("/preview.png")
 def preview():
     return Response(render.render_preview_png(), mimetype="image/png")
+
+
+# Failure reports POSTed by the board, which usually has no serial console.
+BOARD_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.log")
+
+
+@app.route("/log", methods=["POST"])
+def board_log():
+    msg = " ".join(request.get_data(as_text=True)[:1000].split())
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    print(f"[board] {line}", flush=True)
+    with open(BOARD_LOG, "a") as fh:
+        fh.write(line + "\n")
+    return "", 204
+
+
+@app.route("/log", methods=["GET"])
+def board_log_view():
+    try:
+        with open(BOARD_LOG) as fh:
+            lines = fh.readlines()[-200:]
+    except FileNotFoundError:
+        lines = ["(no reports yet)\n"]
+    return Response("".join(reversed(lines)), mimetype="text/plain")
 
 
 @app.route("/frame.bin")
