@@ -384,29 +384,44 @@ static bool readHeaderLine(String &line) {
     return false;
 }
 
-static bool fetchAndStream() {
-    Serial.print("HTTP: GET http://");
-    Serial.print(SERVER_HOST);
-    Serial.print(":");
-    Serial.print(SERVER_PORT);
-    Serial.println("/frame.bin");
+// A stalled download resumes where it stopped (Range + If-Range) instead of
+// starting over: the panel keeps the bytes it already has, so only the rest is
+// needed. If the frame changed in between, the server answers 200 with the full
+// new frame and the stream restarts from byte 0.
+#define MAX_RESUMES        4
+#define BODY_STALL_MS      10000UL
 
+// Send the GET and consume the headers. offset > 0 asks for the rest of the
+// frame identified by etag. Returns 200 or 206, or 0 on failure (failure set).
+// Updates etag from the response.
+static int requestFrame(long offset, String &etag) {
     if (!wifi.connect(SERVER_HOST, SERVER_PORT)) {
-        setFailure("connect failed");
-        return false;
+        setFailure("connect failed at %ld/%ld bytes", offset, (long)FRAME_BYTES);
+        return 0;
     }
     const unsigned long requestAt = millis();
 
     wifi.print("GET /frame.bin HTTP/1.1\r\nHost: ");
     wifi.print(SERVER_HOST);
+    if (offset > 0) {
+        wifi.print("\r\nRange: bytes=");
+        wifi.print(offset);
+        wifi.print("-\r\nIf-Range: ");
+        wifi.print(etag);
+    }
     wifi.print("\r\nConnection: close\r\nUser-Agent: epaper-dashboard/1\r\n\r\n");
 
     String line;
-    if (!readHeaderLine(line) || line.indexOf(" 200") < 0) {
+    int status = 0;
+    if (readHeaderLine(line)) {
+        if (line.indexOf(" 200") >= 0) status = 200;
+        else if (offset > 0 && line.indexOf(" 206") >= 0) status = 206;
+    }
+    if (!status) {
         setFailure("bad status line after %lums: '%.80s'",
                    millis() - requestAt, line.c_str());
         wifi.stop();
-        return false;
+        return 0;
     }
     bool headersDone = false;
     while (readHeaderLine(line)) {
@@ -419,48 +434,104 @@ static bool fetchAndStream() {
                 Serial.print(v / 1000);
                 Serial.println("s");
             }
+        } else if (line.startsWith("ETag:")) {
+            etag = line.substring(5);
+            etag.trim();
         }
     }
     if (!headersDone) {
         setFailure("headers truncated after %lums", millis() - requestAt);
         wifi.stop();
-        return false;
+        return 0;
     }
+    return status;
+}
 
-    EPD_7IN3E_SendCommand(0x10);
-
-    const unsigned long bodyAt = millis();
-    long got = 0;
+// Stream body bytes into the panel until the frame is complete or the
+// connection closes or stalls. Advances got; returns the stop reason.
+static const char *streamBody(long &got) {
+    // Bulk reads: read(buf, n) pulls straight from WiFiS3's 1 KB receive
+    // buffer, refilling it in one bridge round trip when empty. Checking
+    // available() first would cost a second round trip per refill.
+    static uint8_t buf[1024];
     unsigned long lastByteAt = millis();
-    const char *stopReason = "complete";
     while (got < FRAME_BYTES) {
-        int avail = wifi.available();
-        if (avail > 0) {
-            while (avail-- > 0 && got < FRAME_BYTES) {
-                EPD_7IN3E_SendData((UBYTE)wifi.read());
-                got++;
-            }
+        long want = FRAME_BYTES - got;
+        int n = wifi.read(buf, want < (long)sizeof(buf) ? (size_t)want : sizeof(buf));
+        if (n > 0) {
+            for (int i = 0; i < n; i++) EPD_7IN3E_SendData(buf[i]);
+            got += n;
             lastByteAt = millis();
         } else if (!wifi.connected()) {
-            stopReason = "closed";
-            break;
-        } else if (millis() - lastByteAt > 10000) {
-            stopReason = "stalled";
-            break;
+            return "closed";
+        } else if (millis() - lastByteAt > BODY_STALL_MS) {
+            return "stalled";
+        } else {
+            delay(1);
         }
         animTick();
     }
-    wifi.stop();
+    return "complete";
+}
 
-    Serial.print("HTTP: streamed ");
-    Serial.print(got);
-    Serial.print(" / ");
-    Serial.println(FRAME_BYTES);
-    if (got != FRAME_BYTES) {
-        setFailure("body %s at %ld/%ld bytes; headers %lums, body %lums",
-                   stopReason, got, (long)FRAME_BYTES,
-                   bodyAt - requestAt, millis() - bodyAt);
-        return false;
+static bool fetchAndStream() {
+    Serial.print("HTTP: GET http://");
+    Serial.print(SERVER_HOST);
+    Serial.print(":");
+    Serial.print(SERVER_PORT);
+    Serial.println("/frame.bin");
+
+    String etag;
+    long got = 0;
+    int resumes = 0;
+    long firstStallAt = -1;
+    const char *firstStopReason = "";
+    const unsigned long startAt = millis();
+
+    for (;;) {
+        int status = requestFrame(got, etag);
+        if (!status) {
+            // Mid-frame, a failed reconnect spends a resume rather than the
+            // whole refresh.
+            if (got == 0 || ++resumes > MAX_RESUMES) return false;
+            delay(1000);
+            continue;
+        }
+        if (status == 200) {
+            if (got > 0) Serial.println("HTTP: frame changed, restarting stream");
+            EPD_7IN3E_SendCommand(0x10);
+            got = 0;
+        }
+
+        const char *stopReason = streamBody(got);
+        wifi.stop();
+
+        Serial.print("HTTP: streamed ");
+        Serial.print(got);
+        Serial.print(" / ");
+        Serial.println(FRAME_BYTES);
+        if (got == FRAME_BYTES) break;
+
+        if (firstStallAt < 0) {
+            firstStallAt = got;
+            firstStopReason = stopReason;
+        }
+        if (++resumes > MAX_RESUMES) {
+            setFailure("body %s at %ld/%ld bytes after %d resumes; first %s at %ld, %lums total",
+                       stopReason, got, (long)FRAME_BYTES, MAX_RESUMES,
+                       firstStopReason, firstStallAt, millis() - startAt);
+            return false;
+        }
+        Serial.print("HTTP: ");
+        Serial.print(stopReason);
+        Serial.print(", resuming at ");
+        Serial.println(got);
+    }
+
+    // Report recovered downloads too, so board.log shows how often stalls happen.
+    if (resumes > 0) {
+        setFailure("ok after %d resume(s); first %s at %ld bytes, %lums total",
+                   resumes, firstStopReason, firstStallAt, millis() - startAt);
     }
     return true;
 }

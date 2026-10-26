@@ -1,5 +1,6 @@
 """Flask app: browser preview + raw frame buffer for the R4."""
 import errno
+import hashlib
 import os
 import sys
 import threading
@@ -161,11 +162,56 @@ def board_log_view():
     return Response("".join(reversed(lines)), mimetype="text/plain")
 
 
+# The R4 drains the socket through its ESP32 WiFi bridge over a 115200-baud
+# UART, so it can't take more than ~11 KB/s. Sent unpaced, the whole frame
+# piles up in the bridge, and downloads stall partway through. Pace the body
+# just under the drain rate. FRAME_SEND_BPS=0 sends unpaced.
+FRAME_SEND_BPS = int(os.environ.get("FRAME_SEND_BPS", "8192"))
+FRAME_CHUNK = 1024
+
+# The last frame served, so a board resuming a stalled download with
+# Range + If-Range gets the rest of the same bytes even if a fresh render
+# would differ.
+_served = {"etag": None, "buf": b""}
+_served_lock = threading.Lock()
+
+
+def _paced(buf: bytes):
+    delay = FRAME_CHUNK / FRAME_SEND_BPS if FRAME_SEND_BPS > 0 else 0
+    for i in range(0, len(buf), FRAME_CHUNK):
+        yield buf[i:i + FRAME_CHUNK]
+        if delay:
+            sleep(delay)
+
+
 @app.route("/frame.bin")
 def frame():
-    buf = render.render_frame_bin()
-    resp = Response(buf, mimetype="application/octet-stream")
-    resp.headers["Content-Length"] = str(len(buf))
+    status, start = 200, 0
+    with _served_lock:
+        resuming = (request.range is not None and request.if_range.etag is not None
+                    and request.if_range.etag == _served["etag"])
+        if resuming:
+            buf, etag = _served["buf"], _served["etag"]
+    if resuming:
+        span = request.range.range_for_length(len(buf))
+        if span is not None:
+            status, start = 206, span[0]
+    else:
+        buf = render.render_frame_bin()
+        etag = hashlib.sha1(buf).hexdigest()[:16]
+        with _served_lock:
+            _served["etag"], _served["buf"] = etag, buf
+
+    body = buf[start:]
+    resp = Response(_paced(body), status=status, mimetype="application/octet-stream")
+    # An explicit length keeps Werkzeug from chunk-encoding the generator,
+    # which the firmware doesn't parse.
+    resp.headers["Content-Length"] = str(len(body))
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.set_etag(etag)
+    if status == 206:
+        resp.headers["Content-Range"] = f"bytes {start}-{len(buf) - 1}/{len(buf)}"
+        print(f"[frame] resuming at {start}/{len(buf)}", flush=True)
     # Tell the board when to come back for the next frame.
     resp.headers["X-Next-Refresh-Ms"] = str(ms_until_next_refresh())
     return resp
