@@ -293,33 +293,49 @@ static void wakeServer() {
 static void wakeServer() {}
 #endif
 
-// ─── Remote failure log ───────────────────────────────────────────────────────
-// The board usually runs without a serial console, so failures are POSTed to
-// the server's /log endpoint (appended to server/board.log). A report that
-// can't be delivered — e.g. WiFi itself is down — stays pending and goes out
-// before the next fetch. One slot: a newer failure replaces an unsent one.
+// ─── Remote log ───────────────────────────────────────────────────────────────
+// The board usually runs without a serial console, so boots, failures and
+// successful refreshes are POSTed to the server's /log endpoint (appended to
+// server/board.log). A report that can't be delivered — e.g. WiFi itself is
+// down — stays pending and goes out before the next fetch. One slot: a newer
+// report replaces an unsent one.
+
+// Build timestamp, stamped on every report so board.log shows which firmware
+// produced each line.
+#define FW_BUILD __DATE__ " " __TIME__
 
 static char failReason[200];
 static bool reportPending = true;   // first report announces the boot
 
+static void vsetReport(const char *tag, const char *fmt, va_list ap) {
+    vsnprintf(failReason, sizeof(failReason), fmt, ap);
+    Serial.print(tag);
+    Serial.println(failReason);
+    reportPending = true;
+}
+
 static void setFailure(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(failReason, sizeof(failReason), fmt, ap);
+    vsetReport("fail: ", fmt, ap);
     va_end(ap);
-    Serial.print("fail: ");
-    Serial.println(failReason);
-    reportPending = true;
+}
+
+static void setSuccess(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsetReport("report: ", fmt, ap);
+    va_end(ap);
 }
 
 static void sendReport() {
     if (!reportPending || WiFi.status() != WL_CONNECTED) return;
 
-    char body[320];
+    char body[360];
     int n = snprintf(body, sizeof(body),
-                     "%s uptime_s=%lu fails=%u rssi=%ld",
+                     "%s uptime_s=%lu fails=%u rssi=%ld fw=%s",
                      failReason[0] ? failReason : "boot",
-                     millis() / 1000, failedRefreshes, (long)WiFi.RSSI());
+                     millis() / 1000, failedRefreshes, (long)WiFi.RSSI(), FW_BUILD);
 
     WiFiClient c;
     if (!c.connect(SERVER_HOST, SERVER_PORT)) {
@@ -528,10 +544,13 @@ static bool fetchAndStream() {
         Serial.println(got);
     }
 
-    // Report recovered downloads too, so board.log shows how often stalls happen.
+    // Report successes too, so board.log shows every refresh and how often
+    // stalls were recovered from.
     if (resumes > 0) {
-        setFailure("ok after %d resume(s); first %s at %ld bytes, %lums total",
+        setSuccess("ok after %d resume(s); first %s at %ld bytes, %lums total",
                    resumes, firstStopReason, firstStallAt, millis() - startAt);
+    } else {
+        setSuccess("ok in %lums", millis() - startAt);
     }
     return true;
 }
