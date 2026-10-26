@@ -300,9 +300,15 @@ static void wakeServer() {}
 // down — stays pending and goes out before the next fetch. One slot: a newer
 // report replaces an unsent one.
 
-// Build timestamp, stamped on every report so board.log shows which firmware
-// produced each line.
-#define FW_BUILD __DATE__ " " __TIME__
+// Firmware version, stamped on every report so board.log shows which firmware
+// produced each line. firmware/flash.sh generates version.h from git describe
+// at compile time; builds without it (e.g. from the IDE) are unversioned.
+#if __has_include("src/version.h")
+#include "src/version.h"
+#endif
+#ifndef FW_VERSION
+#define FW_VERSION "unversioned"
+#endif
 
 static char failReason[200];
 static bool reportPending = true;   // first report announces the boot
@@ -335,7 +341,7 @@ static void sendReport() {
     int n = snprintf(body, sizeof(body),
                      "%s uptime_s=%lu fails=%u rssi=%ld fw=%s",
                      failReason[0] ? failReason : "boot",
-                     millis() / 1000, failedRefreshes, (long)WiFi.RSSI(), FW_BUILD);
+                     millis() / 1000, failedRefreshes, (long)WiFi.RSSI(), FW_VERSION);
 
     WiFiClient c;
     if (!c.connect(SERVER_HOST, SERVER_PORT)) {

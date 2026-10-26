@@ -171,7 +171,11 @@ cd server
    (the `PORT` env var, default 5000 — but 5002 if you set it for macOS).
    `secrets.h` is gitignored so your credentials stay out of the repo.
 
-4. Flash the board. The built-in 12×8 LED matrix shows a **beating heart**
+4. Flash the board with `firmware/flash.sh` (needs `arduino-cli`), which bakes
+   the `git describe` version into the build so every `board.log` line names
+   the firmware it came from (`fw=v0.1.0-3-g454a435`, `-dirty` for uncommitted
+   changes). Flashing from the IDE works too, but reports `fw=unversioned`.
+   The built-in 12×8 LED matrix shows a **beating heart**
    while the R4 is busy on WiFi / HTTP / SPI, so you can tell at a glance that
    it's working.
 

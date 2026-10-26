@@ -9,3 +9,4 @@ server.log
 relay.log
 firmware/epaper_dashboard/secrets.h
 board.log
+firmware/epaper_dashboard/src/version.h
