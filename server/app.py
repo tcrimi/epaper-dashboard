@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import os
+import subprocess
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -74,6 +75,39 @@ def ms_until_next_refresh() -> int:
     return int((_next_refresh(now + timedelta(minutes=2)) - now).total_seconds() * 1000)
 
 
+# macOS doesn't count serving a request as activity. The board's Wake-on-LAN
+# only buys ~10s of DarkWake, and a paced frame takes ~25s, so without a power
+# assertion the Mac sleeps mid-download (sshd holds one for its sessions, which
+# is why those keep it up). Each request starts or extends a time-limited
+# caffeinate: -s holds system sleep off on AC power, DarkWake included; -i
+# covers idle sleep. The timeout means a hold can never outlive its work by much.
+AWAKE_HOLD_S = int(os.environ.get("AWAKE_HOLD_S", "120"))
+_awake_until = 0.0
+_awake_lock = threading.Lock()
+
+
+def hold_awake(seconds: int = AWAKE_HOLD_S) -> None:
+    global _awake_until
+    if sys.platform != "darwin":
+        return
+    with _awake_lock:
+        now = time()
+        # A running hold still covers most of the window: leave it be.
+        if _awake_until - now > seconds / 2:
+            return
+        try:
+            subprocess.Popen(["caffeinate", "-s", "-i", "-t", str(seconds)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _awake_until = now + seconds
+        except OSError as e:
+            print(f"[awake] caffeinate failed: {e}", flush=True)
+
+
+@app.before_request
+def _hold_awake_for_request():
+    hold_awake()
+
+
 def _prewarm_loop() -> None:
     """Pick and fetch the hero for each upcoming wake PREWARM_LEAD_MIN minutes
     ahead, so the board reads a ready image and never waits on a fetch."""
@@ -83,6 +117,9 @@ def _prewarm_loop() -> None:
         wait = (target - timedelta(minutes=PREWARM_LEAD_MIN) - now).total_seconds()
         if wait > 0:
             sleep(wait)
+        # Only runs if the Mac is awake at this point, but once running, don't
+        # let it fall asleep halfway through the fetches.
+        hold_awake(300)
         try:
             hero = sources.refresh_hero(target.hour)
             print(f"[prewarm] hero for {target:%H:%M}: {hero and hero.get('title')}", flush=True)
